@@ -83,5 +83,40 @@
     "description": "长推理群提示文案",
     "type": "string",
     "default": "还在思考哦"
+  },
+  "honzi_jm_download_dir": {
+    "description": "JM 本子 zip 目录（空则自动探测 jm_cosmos download_dir / 环境变量 JM_DOWNLOAD_DIR）",
+    "type": "string",
+    "hint": "例如 /AstrBot/data/plugin_data/jm_cosmos2/downloads",
+    "default": ""
+  },
+  "honzi_zip_password": {
+    "description": "JM zip 解压/提示密码",
+    "type": "string",
+    "hint": "与 JM-Cosmos pack_password 一致",
+    "default": "dickding"
+  },
+  "honzi_nsfw_backend": {
+    "description": "本子页本地 NSFW 后端（禁止云端视觉）",
+    "type": "string",
+    "hint": "auto / nudenet / opencv / heuristic；禁止 deepseek/openai 等",
+    "default": "auto"
+  },
+  "honzi_nudenet_model_path": {
+    "description": "NudeNet ONNX 权重绝对路径（空则探测 ~/.NudeNet 与插件 data）",
+    "type": "string",
+    "hint": "只读本地文件，不会为审查去下载/调用云端视觉",
+    "default": ""
+  },
+  "honzi_nsfw_threshold": {
+    "description": "本地 NudeNet 整页剔除阈值（0–1）",
+    "type": "float",
+    "default": 0.6
+  },
+  "honzi_max_pages": {
+    "description": "单次本子最多反推页数",
+    "type": "int",
+    "hint": "超出按文件名自然序截断",
+    "default": 40
   }
 }
