@@ -20,6 +20,11 @@ from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
+try:
+    from astrbot.api.message_components import File as FileComp
+except Exception:  # pragma: no cover
+    FileComp = None  # type: ignore
+
 
 def _load_metadata_strip():
     """Load shared stripper from astrbot_plugin_nai_guard (sibling plugin)."""
@@ -63,12 +68,42 @@ _QUOTA_ADMIN_FALLBACK = {_OWNER_QQ, "astrbot"}
 try:
     from .quota import GroupQuotaStore, default_db_path
     from . import manga_layout as _ml
+    from .honzi_cmd import parse_honzi_command
+    from .honzi_filter import CloudVisionForbidden, LocalNsfwFilter
+    from .honzi_queue import HonziQueue, JobBusyError, JobStatus, get_queue, session_key
+    from .honzi_source import (
+        DEFAULT_ZIP_PASSWORD,
+        SessionZipIndex,
+        SessionZipRecord,
+        ZipHint,
+        extract_zip_pages,
+        parse_zip_hints,
+        resolve_zip,
+    )
 except ImportError:  # pragma: no cover
     import sys as _sys
 
     _sys.path.insert(0, str(Path(__file__).resolve().parent))
     from quota import GroupQuotaStore, default_db_path  # type: ignore
     import manga_layout as _ml  # type: ignore
+    from honzi_cmd import parse_honzi_command  # type: ignore
+    from honzi_filter import CloudVisionForbidden, LocalNsfwFilter  # type: ignore
+    from honzi_queue import (  # type: ignore
+        HonziQueue,
+        JobBusyError,
+        JobStatus,
+        get_queue,
+        session_key,
+    )
+    from honzi_source import (  # type: ignore
+        DEFAULT_ZIP_PASSWORD,
+        SessionZipIndex,
+        SessionZipRecord,
+        ZipHint,
+        extract_zip_pages,
+        parse_zip_hints,
+        resolve_zip,
+    )
 
 
 
@@ -572,6 +607,8 @@ class Nai5MutsumiPlugin(Star):
             default_db_path(),
             limit=self._cfg_int("nai5_group_limit", 40),
         )
+        self._honzi_q: HonziQueue = get_queue()
+        self._honzi_index = SessionZipIndex(self._honzi_index_path())
         logger.info(
             "[%s] loaded enable=%s provider=%s skill_sfw=%s skill_adult=%s quota_db=%s limit=%s",
             PLUGIN_NAME,
@@ -607,6 +644,15 @@ class Nai5MutsumiPlugin(Star):
         if self._quota.limit != lim:
             self._quota.set_limit(lim)
         return lim
+
+    def _honzi_index_path(self) -> Path:
+        override = os.environ.get("NAI5_HONZI_INDEX")
+        if override:
+            return Path(override)
+        return Path(default_db_path()).parent / "honzi_last.json"
+
+    def _honzi_zip_password(self) -> str:
+        return self._cfg_str("honzi_zip_password", DEFAULT_ZIP_PASSWORD) or DEFAULT_ZIP_PASSWORD
 
     @staticmethod
     def _is_nai5_model(model: str) -> bool:
@@ -2093,6 +2139,10 @@ class Nai5MutsumiPlugin(Star):
             getattr(cfg.defaults, "model", None) or "nai-diffusion-5-full",
         )
         steps = str(getattr(cfg.defaults, "steps", 23) or 23)
+        try:
+            steps = str(min(28, max(1, int(float(steps)))))
+        except (TypeError, ValueError):
+            steps = "23"
         scale = str(getattr(cfg.defaults, "scale", 5.0) or 5.0)
         sampler = getattr(cfg.defaults, "sampler", None) or "k_euler_ancestral"
         noise = getattr(cfg.defaults, "noise_schedule", None) or "karras"
@@ -2237,7 +2287,7 @@ class Nai5MutsumiPlugin(Star):
         msg = re.sub(r"@\S+", " ", msg)
         msg = re.sub(r"\s+", " ", msg).strip()
         m = re.match(
-            r"(?is)^[/!！]?(nai5画反推漫画|mutsumi画反推漫画|nai5反推漫画|睦画反推漫画|nai5画反推|mutsumi画反推|nai5反推|睦画反推|nai5画|mutsumi画|nai5|睦画)[:：\s]*(.*)$",
+            r"(?is)^[/!！]?(nai5画本子|mutsumi画本子|nai5本子|睦画本子|nai5画反推漫画|mutsumi画反推漫画|nai5反推漫画|睦画反推漫画|nai5画反推|mutsumi画反推|nai5反推|睦画反推|nai5画|mutsumi画|nai5|睦画)[:：\s]*(.*)$",
             msg,
         )
         if m:
@@ -2437,6 +2487,439 @@ class Nai5MutsumiPlugin(Star):
             await self._send_plain_quiet(
                 event, "……画好了。" if ok else "……图画好了，发出去失败。再说一次试试。"
             )
+
+    def _honzi_session(self, event: AstrMessageEvent) -> tuple[str, str, str]:
+        uid = str(event.get_sender_id() or "").strip()
+        gid = str(event.get_group_id() or "").strip()
+        return session_key(uid, gid), uid, gid
+
+    def _collect_honzi_hints(self, event: AstrMessageEvent) -> ZipHint:
+        texts: list[str] = [
+            event.message_str or "",
+            getattr(event, "message_str", "") or "",
+        ]
+        try:
+            texts.append(event.get_message_outline() or "")
+        except Exception:
+            pass
+        paths: list[str] = []
+
+        def _eat_comp(comp: Any) -> None:
+            text = getattr(comp, "text", None) or getattr(comp, "content", None)
+            if isinstance(text, str) and text.strip():
+                texts.append(text)
+            name = getattr(comp, "name", None)
+            file = getattr(comp, "file", None) or getattr(comp, "path", None)
+            for cand in (name, file):
+                if cand and str(cand).lower().endswith(".zip"):
+                    paths.append(str(file or cand))
+                    texts.append(str(cand))
+
+        for comp in self._message_chain(event):
+            if isinstance(comp, Reply):
+                texts.append(str(getattr(comp, "message_str", "") or ""))
+                texts.append(str(getattr(comp, "content", "") or ""))
+                texts.append(str(getattr(comp, "text", "") or ""))
+                for rc in getattr(comp, "chain", None) or []:
+                    _eat_comp(rc)
+            else:
+                _eat_comp(comp)
+        return parse_zip_hints(*texts, extra_paths=paths)
+
+    def _page_to_data_uri(self, path: Path) -> str:
+        raw = Path(path).read_bytes()
+        jpeg = self._compress_jpeg_bytes(
+            raw, max_edge=1536, quality=88, max_bytes=1_800_000
+        )
+        b64 = base64.b64encode(jpeg).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+
+    async def _send_honzi_zip(
+        self, event: AstrMessageEvent, zip_path: Path, album_id: str
+    ) -> None:
+        """对齐 JM-Cosmos：聊天记录只放字；zip 走普通 File，图不进 Nodes。"""
+        pwd = self._honzi_zip_password()
+        info = (
+            f"本子 {album_id or zip_path.stem}\n"
+            f"回传 JM 安装包（zip，密码 {pwd}）。\n"
+            "图片不塞进合并转发，避免过期。"
+        )
+        try:
+            from astrbot.api.event import MessageChain
+            from astrbot.api.message_components import Node, Nodes
+
+            uin, name = self._chat_record_identity(event)
+            nodes = Nodes([Node(content=[Plain(info)], uin=uin, name=name)])
+            await event.send(MessageChain([nodes]))
+        except Exception as e:
+            logger.warning("[%s] honzi nodes text fallback: %s", PLUGIN_NAME, e)
+            await self._send_plain_quiet(event, info)
+        sent = False
+        if FileComp is not None:
+            try:
+                from astrbot.api.event import MessageChain
+
+                await event.send(
+                    MessageChain(
+                        [FileComp(name=zip_path.name, file=str(zip_path))]
+                    )
+                )
+                sent = True
+            except Exception as e:
+                logger.warning("[%s] honzi File send failed: %s", PLUGIN_NAME, e)
+        if not sent:
+            await self._send_plain_quiet(
+                event, f"……zip 在 {zip_path}（发出失败，密码 {pwd}）。"
+            )
+
+    def _make_honzi_filter(self) -> LocalNsfwFilter:
+        return LocalNsfwFilter(
+            backend=self._cfg_str("honzi_nsfw_backend", "auto"),
+            model_path=self._cfg_str("honzi_nudenet_model_path", ""),
+            drop_threshold=float(self.config.get("honzi_nsfw_threshold", 0.6) or 0.6),
+        )
+
+    async def _honzi_generate_page(
+        self,
+        event: AstrMessageEvent,
+        page: Path,
+        desc: str,
+        *,
+        allow_nsfw: bool,
+        model: str,
+    ) -> tuple[bytes, str]:
+        """单页走现有漫画反推：LAYOUT→A1–E5 → ppnai。不复制 LLM 逻辑。"""
+        uri = self._page_to_data_uri(page)
+        prompt, uc, size, chars, mode = await self._with_thinking_ping(
+            event,
+            self._llm_prompt(
+                desc,
+                allow_nsfw=allow_nsfw,
+                image_urls=[uri],
+                reverse_mode=True,
+                manga_reverse=True,
+            ),
+        )
+        if not prompt:
+            raise RuntimeError("本页提示词为空")
+        try:
+            w, h = [int(x) for x in (size or "1024x1024").lower().split("x")]
+            size = self._clamp_size(w, h, "1024x1024")
+        except Exception:
+            size = "1024x1024"
+        img = await self._generate_via_ppnai(
+            prompt,
+            uc,
+            size,
+            owner_id=str(event.get_sender_id() or "0"),
+            characters=chars,
+            model=model,
+            source_text=desc,
+            nsfw_ok=bool(allow_nsfw) and str(mode).startswith("adult"),
+        )
+        return img, mode
+
+    def _honzi_pick_model(self, event: AstrMessageEvent) -> tuple[str, str, bool, int]:
+        sender = str(event.get_sender_id() or "").strip()
+        gid = str(event.get_group_id() or "").strip()
+        quota_key = gid if gid else (f"p:{sender}" if sender else "")
+        limit = self._quota_limit()
+        nai5_model = self._cfg_str("nai5_model", "nai-diffusion-5-full")
+        fallback = self._cfg_str("nai5_fallback_model", "nai-diffusion-4-5-full")
+        used = self._quota.get_count(quota_key) if quota_key else 0
+        downgraded = bool(quota_key) and used >= limit
+        model = fallback if downgraded else nai5_model
+        return model, quota_key, downgraded, used
+
+    async def _honzi_run(self, event: AstrMessageEvent, job_id: str, desc: str) -> None:
+        job = self._honzi_q.get(job_id)
+        if job is None:
+            return
+        work: Path | None = None
+        try:
+            if self._honzi_q.should_stop(job_id):
+                self._honzi_q.finish(job_id)
+                return
+            self._honzi_q.update(job_id, status=JobStatus.RESOLVING)
+            hint = self._collect_honzi_hints(event)
+            last = self._honzi_index.get(job.session_key) or self._honzi_index.get_user(
+                job.user_id
+            )
+            extra_dir = self._cfg_str("honzi_jm_download_dir", "")
+            cand = resolve_zip(hint, last=last, extra_dir=extra_dir or None)
+            if cand is None:
+                await self._send_plain_quiet(
+                    event,
+                    "……找不到本子包。先 jm <ID> 下载，或引用带本子 ID/zip 的消息再 nai5本子。",
+                )
+                self._honzi_q.finish(job_id, error="no zip")
+                return
+            album_id = cand.album_id or (hint.album_ids[0] if hint.album_ids else "")
+            self._honzi_q.update(
+                job_id,
+                zip_path=str(cand.path),
+                album_id=album_id or "",
+                status=JobStatus.SENDING_ZIP,
+            )
+            self._honzi_index.put(
+                SessionZipRecord(
+                    session_key=job.session_key,
+                    user_id=job.user_id,
+                    path=str(cand.path),
+                    album_id=album_id or "",
+                    mtime=cand.mtime,
+                )
+            )
+            await self._send_plain_quiet(
+                event,
+                f"……找到本子 {album_id or cand.path.name}，先回传安装包。",
+            )
+            await self._send_honzi_zip(event, cand.path, album_id or "")
+            if self._honzi_q.should_stop(job_id):
+                self._honzi_q.finish(job_id)
+                await self._send_plain_quiet(event, "……本子已取消。")
+                return
+
+            self._honzi_q.update(job_id, status=JobStatus.FILTERING)
+            await self._send_plain_quiet(
+                event, "……本地滤页中（NudeNet/OpenCV/启发式，不走 DeepSeek 视觉）。"
+            )
+            try:
+                filt = self._make_honzi_filter()
+            except CloudVisionForbidden as e:
+                await self._send_plain_quiet(event, f"……过滤配置非法：{e}")
+                self._honzi_q.finish(job_id, error=str(e))
+                return
+            work, pages = await asyncio.to_thread(
+                extract_zip_pages,
+                cand.path,
+                None,
+                password=self._honzi_zip_password(),
+            )
+            max_pages = max(1, self._cfg_int("honzi_max_pages", 40))
+            if len(pages) > max_pages:
+                logger.info(
+                    "[%s] honzi truncate pages %s -> %s",
+                    PLUGIN_NAME,
+                    len(pages),
+                    max_pages,
+                )
+                pages = pages[:max_pages]
+            kept_dir = work / "_kept"
+            kept, results = await asyncio.to_thread(filt.filter_pages, pages, kept_dir)
+            dropped = sum(1 for r in results if r.decision.action == "drop")
+            self._honzi_q.update(
+                job_id,
+                kept=len(kept),
+                dropped=dropped,
+                total_pages=len(kept),
+                filter_backend=filt.backend_id,
+                status=JobStatus.QUEUED,
+            )
+            logger.info(
+                "[%s] honzi filter backend=%s cloud=never kept=%s dropped=%s album=%s",
+                PLUGIN_NAME,
+                filt.backend_id,
+                len(kept),
+                dropped,
+                album_id,
+            )
+            if not kept:
+                await self._send_plain_quiet(
+                    event, "……滤完没有可画的页（都过审不了）。换一本或放宽阈值。"
+                )
+                self._honzi_q.finish(job_id, error="all dropped")
+                return
+            await self._send_plain_quiet(
+                event,
+                f"……保留 {len(kept)} 页，剔除 {dropped} 页。"
+                f"后端 {filt.backend_id}。开始排队反推。nai5本子取消 可停。",
+            )
+
+            sender = str(event.get_sender_id() or "").strip()
+            gid = str(event.get_group_id() or "").strip()
+            allow_nsfw = _affection_can_nsfw(sender, gid)
+            page_desc = desc or (
+                "按附图还原多格漫画分镜与气泡对白；保留格数/排版/阅读顺序、各格动作，"
+                "以及对话框/旁白原文（看不清再省略）；"
+                "角色跟随用户要求，无要求则保留原图角色（勿默认学生团）"
+            )
+            if desc:
+                page_desc = (
+                    "按附图还原多格漫画分镜与气泡对白；保留格数/排版/阅读顺序与各格动作；"
+                    f"用户修改要求：{desc}。"
+                    "换角色只改身份/服装，分镜与对白跟原页。"
+                )
+
+            for i, page in enumerate(kept, start=1):
+                if self._honzi_q.should_stop(job_id):
+                    self._honzi_q.finish(job_id)
+                    await self._send_plain_quiet(
+                        event, f"……本子已取消。已出 {self._honzi_q.get(job_id).generated} 页。"
+                    )
+                    return
+                if self._lock.locked():
+                    try:
+                        await event.send(
+                            event.plain_result(
+                                self._cfg_str(
+                                    "busy_message", "……在画了。排队。慢慢画，别急。"
+                                )
+                            )
+                        )
+                    except Exception:
+                        pass
+                async with self._lock:
+                    if self._honzi_q.should_stop(job_id):
+                        break
+                    self._honzi_q.update(job_id, status=JobStatus.GENERATING)
+                    self._honzi_q.mark_page(job_id, i)
+                    model, quota_key, downgraded, used = self._honzi_pick_model(event)
+                    await self._send_plain_quiet(
+                        event,
+                        f"……本子 {i}/{len(kept)} 页在画。{album_id or ''}".strip(),
+                    )
+                    try:
+                        img, mode = await self._honzi_generate_page(
+                            event,
+                            page,
+                            page_desc,
+                            allow_nsfw=allow_nsfw,
+                            model=model,
+                        )
+                    except Exception as e:
+                        logger.exception("[%s] honzi page %s failed", PLUGIN_NAME, i)
+                        err = str(e)
+                        if len(err) > 180:
+                            err = err[:180] + "…"
+                        await self._send_plain_quiet(
+                            event, f"……第 {i} 页失败，跳过。{err}"
+                        )
+                        continue
+                    if quota_key and self._is_nai5_model(model) and not downgraded:
+                        self._quota.increment(quota_key)
+                    self._honzi_q.update(job_id, status=JobStatus.SENDING)
+                    try:
+                        jpeg = self._compress_jpeg_bytes(
+                            img, max_edge=2048, quality=92, max_bytes=2500000
+                        )
+                        async with _qq_image_send_lock:
+                            ok = await self._send_onebot_image_only(event, jpeg)
+                            if not ok:
+                                await event.send(
+                                    event.chain_result([Image.fromBytes(jpeg)])
+                                )
+                        await self._send_plain_quiet(
+                            event, f"……本子 {i}/{len(kept)} 画好了。"
+                        )
+                    except Exception as e:
+                        logger.warning("[%s] honzi send page fail: %s", PLUGIN_NAME, e)
+                        await self._send_plain_quiet(
+                            event, f"……第 {i} 页发出失败。"
+                        )
+                    self._honzi_q.mark_page(job_id, i, generated=True)
+                    logger.info(
+                        "[%s] honzi page done i=%s/%s model=%s mode=%s used=%s downgraded=%s",
+                        PLUGIN_NAME,
+                        i,
+                        len(kept),
+                        model,
+                        mode,
+                        used,
+                        downgraded,
+                    )
+
+            if self._honzi_q.should_stop(job_id):
+                self._honzi_q.finish(job_id)
+                await self._send_plain_quiet(event, "……本子已取消。")
+                return
+            self._honzi_q.finish(job_id)
+            fin = self._honzi_q.get(job_id)
+            await self._send_plain_quiet(
+                event,
+                f"……本子跑完了。出图 {fin.generated if fin else 0}，"
+                f"保留 {len(kept)}，剔除 {dropped}。",
+            )
+        except Exception as e:
+            logger.exception("[%s] honzi run failed", PLUGIN_NAME)
+            err = str(e)
+            if len(err) > 240:
+                err = err[:240] + "…"
+            self._honzi_q.finish(job_id, error=err)
+            await self._send_plain_quiet(event, f"……本子失败。{err}")
+        finally:
+            if work is not None:
+                try:
+                    import shutil
+
+                    shutil.rmtree(work, ignore_errors=True)
+                except Exception:
+                    pass
+
+    async def _honzi_dispatch(
+        self, event: AstrMessageEvent, text: str | None = None
+    ):
+        if not self._cfg_bool("enable", True):
+            return
+        raw = (text if text is not None else (event.message_str or "")).strip()
+        cmd = parse_honzi_command(raw)
+        if cmd.kind == "unknown" and text:
+            cmd = parse_honzi_command(f"nai5本子 {text}")
+        key, uid, gid = self._honzi_session(event)
+        if cmd.kind == "cancel":
+            job = self._honzi_q.cancel(key)
+            if job is None:
+                yield event.plain_result("……没有在跑的本子。")
+            else:
+                yield event.plain_result(job.progress_text())
+            return
+        if cmd.kind == "status":
+            job = self._honzi_q.get_session(key)
+            if job is None:
+                yield event.plain_result("……没有本子任务。先 nai5本子 <要求>。")
+            else:
+                yield event.plain_result(job.progress_text())
+            return
+
+        desc = cmd.requirement
+        try:
+            from _qqbot_common.ratelimit import check_event, refuse_text
+
+            ok, wait = check_event(event, "draw")
+            if not ok:
+                yield event.plain_result(refuse_text(wait))
+                return
+        except Exception:
+            pass
+
+        allow_nsfw = _affection_can_nsfw(uid, gid)
+        if not allow_nsfw and _user_asked_nsfw(desc):
+            cur, need = _affection_scores(uid, gid)
+            _aff_audit("refuse", uid, gid, score=cur, cmd="nai5本子")
+            yield event.plain_result(_nsfw_refuse_taunt(cur, need))
+            return
+        cur0, _ = _affection_scores(uid, gid)
+        _aff_audit(
+            "allow" if allow_nsfw else "sfw_force",
+            uid,
+            gid,
+            score=cur0,
+            cmd="nai5本子",
+        )
+        try:
+            job = self._honzi_q.create(
+                user_id=uid, group_id=gid, requirement=desc
+            )
+        except JobBusyError as e:
+            yield event.plain_result(
+                f"……本会话已有本子在跑。{e.job.progress_text()}"
+            )
+            return
+        yield event.plain_result(
+            "……好。先回传本子包，再本地滤页、逐页漫画反推。"
+            "进度：nai5本子进度；停：nai5本子取消。"
+        )
+        asyncio.create_task(self._honzi_run(event, job.job_id, desc))
 
     async def _handle(
         self,
@@ -2675,6 +3158,34 @@ class Nai5MutsumiPlugin(Star):
         yield event.plain_result(f"……已重置群 {target} 的 nai5 额度。")
 
     @filter.command(
+        "nai5本子",
+        alias={"睦画本子", "nai5画本子", "mutsumi画本子"},
+    )
+    async def cmd_nai5_honzi(self, event: AstrMessageEvent, desc: GreedyStr = ""):
+        """nai5本子 <要求>：回传 JM zip → 本地滤页 → 逐页漫画反推。"""
+        setattr(event, "_nai5_mutsumi_handled", True)
+        raw = (event.message_str or "").strip()
+        text = (desc or "").strip()
+        if text in {"取消", "停止", "cancel", "stop", "进度", "状态", "status"}:
+            raw = f"nai5本子 {text}"
+        elif not parse_honzi_command(raw).is_honzi:
+            raw = f"nai5本子 {text}".strip()
+        async for r in self._honzi_dispatch(event, raw):
+            yield r
+
+    @filter.command("nai5本子取消", alias={"nai5本子停止", "睦画本子取消"})
+    async def cmd_nai5_honzi_cancel(self, event: AstrMessageEvent):
+        setattr(event, "_nai5_mutsumi_handled", True)
+        async for r in self._honzi_dispatch(event, "nai5本子取消"):
+            yield r
+
+    @filter.command("nai5本子进度", alias={"nai5本子状态", "睦画本子进度"})
+    async def cmd_nai5_honzi_status(self, event: AstrMessageEvent):
+        setattr(event, "_nai5_mutsumi_handled", True)
+        async for r in self._honzi_dispatch(event, "nai5本子进度"):
+            yield r
+
+    @filter.command(
         "nai5反推漫画",
         alias={"睦画反推漫画", "nai5画反推漫画", "mutsumi画反推漫画"},
     )
@@ -2720,6 +3231,12 @@ class Nai5MutsumiPlugin(Star):
         setattr(event, "_nai5_mutsumi_handled", True)
         text = (desc or "").strip() or self._extract_desc(event)
         raw = (event.message_str or "").strip()
+        honzi = parse_honzi_command(raw)
+        if honzi.is_honzi or (text.startswith("本子") and parse_honzi_command(f"nai5{text}").is_honzi):
+            payload = raw if honzi.is_honzi else f"nai5{text}"
+            async for r in self._honzi_dispatch(event, payload):
+                yield r
+            return
         is_rev, rest, is_manga = _strip_reverse_cmd(raw)
         if is_rev:
             async for r in self._handle(
@@ -2739,6 +3256,16 @@ class Nai5MutsumiPlugin(Star):
         raw = re.sub(r"\[CQ:at,[^\]]+\]", " ", raw)
         raw = re.sub(r"@\S+", " ", raw)
         raw = re.sub(r"\s+", " ", raw).strip()
+        honzi = parse_honzi_command(raw)
+        if honzi.is_honzi:
+            setattr(event, "_nai5_mutsumi_handled", True)
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+            async for r in self._honzi_dispatch(event, raw):
+                yield r
+            return
         is_rev, rest, is_manga = _strip_reverse_cmd(raw)
         if is_rev:
             setattr(event, "_nai5_mutsumi_handled", True)
