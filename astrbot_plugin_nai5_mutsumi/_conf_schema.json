@@ -1,0 +1,87 @@
+{
+  "enable": {
+    "description": "启用 nai5 / 睦画",
+    "type": "bool",
+    "hint": "关闭后指令不响应",
+    "default": true
+  },
+  "provider_id": {
+    "description": "用于生成 prompt 的 Provider ID",
+    "type": "string",
+    "hint": "默认 deepseek",
+    "default": "deepseek"
+  },
+  "skill_dir": {
+    "description": "Skill 目录（含 SKILL.md）",
+    "type": "string",
+    "hint": "空则自动探测 /AstrBot/data/skills/nai5-mutsumi 与插件内 skill/",
+    "default": ""
+  },
+  "default_size": {
+    "description": "默认尺寸（宽x高，边长≤1024）",
+    "type": "string",
+    "hint": "如 768x1024",
+    "default": "768x1024"
+  },
+  "busy_message": {
+    "description": "正在出图时的排队提示",
+    "type": "string",
+    "hint": "全局锁占用时先发此提示再排队等待",
+    "default": "……在画了。排队。慢慢画，别急。"
+  },
+  "thinking_message": {
+    "description": "开始处理时的提示",
+    "type": "string",
+    "default": "……好。在想怎么画。"
+  },
+  "send_prompt_preview": {
+    "description": "发图前是否附带简短 prompt 预览",
+    "type": "bool",
+    "default": false
+  },
+  "nai5_group_limit": {
+    "description": "每个群聊成功使用 NAI5 的次数上限",
+    "type": "int",
+    "hint": "达到后该群自动降级到 nai5_fallback_model；私聊不受限",
+    "default": 40
+  },
+  "nai5_model": {
+    "description": "默认 NAI5 模型",
+    "type": "string",
+    "hint": "如 nai-diffusion-5-full",
+    "default": "nai-diffusion-5-full"
+  },
+  "nai5_fallback_model": {
+    "description": "群 NAI5 额度用尽后的降级模型",
+    "type": "string",
+    "hint": "如 nai-diffusion-4-5-full",
+    "default": "nai-diffusion-4-5-full"
+  },
+  "llm_timeout_sec": {
+    "description": "写提示词 LLM 超时秒数（长推理建议 120–180）",
+    "type": "int",
+    "hint": "超时会松锁并提示重试",
+    "default": 180
+  },
+  "llm_reasoning_effort": {
+    "description": "nai5 写提示词推理档位",
+    "type": "string",
+    "hint": "low / medium / high；默认 medium，避免每张都走最长推理",
+    "default": "medium"
+  },
+  "thinking_ping_first_sec": {
+    "description": "首次「还在思考哦」等待秒数",
+    "type": "int",
+    "default": 20
+  },
+  "thinking_ping_every_sec": {
+    "description": "之后每隔多少秒再提示一次",
+    "type": "int",
+    "default": 25
+  },
+  "thinking_ping_message": {
+    "description": "长推理群提示文案",
+    "type": "string",
+    "default": "还在思考哦"
+  }
+}

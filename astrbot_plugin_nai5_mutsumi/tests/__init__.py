@@ -1,0 +1,1 @@
+# unit tests for manga_layout (no AstrBot import)

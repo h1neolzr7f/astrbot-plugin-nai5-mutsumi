@@ -1,0 +1,1 @@
+# reuse ppnai / astrbot deps; no extra pins

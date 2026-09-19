@@ -1,0 +1,15 @@
+name: astrbot_plugin_nai5_mutsumi
+display_name: NAI5 睦画
+desc: 指令 nai5 / 睦画：DeepSeek 按 NAI5 Skill 生成 prompt+UC，经 ppnai 全局串行出图；群 NAI5 额度 40 后降级 4.5；默认满血成人管线；好感不足/学生团点名强制 SFW
+help: |
+  用法：nai5 <描述>；反推：nai5反推；漫画反推：nai5反推漫画（LAYOUT 几何→A1–E5）
+  例：nai5 窗边 mature woman 侧光
+  流程：DeepSeek(provider=deepseek) + Skill → ppnai(NAI5 full, opus_free, max_concurrent=1) 出图
+  群聊每群成功 NAI5 最多 40 张，超出自动改用 nai-diffusion-4-5-full；私聊不受限。
+  查额度：nai5额度 / 出图额度；管理员重置：nai5额度重置 [gid]
+  全局同时只画 1 张；忙时提示「……在画了。排队。」并等待。
+version: 1.4.21
+author: dickding
+repo: local
+support_platforms:
+  - aiocqhttp
