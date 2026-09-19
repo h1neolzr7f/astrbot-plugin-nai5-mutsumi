@@ -2097,6 +2097,7 @@ class Nai5MutsumiPlugin(Star):
         model: str | None = None,
         source_text: str = "",
         nsfw_ok: bool = False,
+        max_steps: int | None = None,
     ) -> bytes:
         ppnai = self._get_ppnai()
         if ppnai is None:
@@ -2150,6 +2151,11 @@ class Nai5MutsumiPlugin(Star):
             getattr(cfg.defaults, "model", None) or "nai-diffusion-5-full",
         )
         steps = str(getattr(cfg.defaults, "steps", 23) or 23)
+        if max_steps is not None:
+            try:
+                steps = str(min(int(max_steps), max(1, int(float(steps)))))
+            except (TypeError, ValueError):
+                steps = str(int(max_steps))
         scale = str(getattr(cfg.defaults, "scale", 5.0) or 5.0)
         sampler = getattr(cfg.defaults, "sampler", None) or "k_euler_ancestral"
         noise = getattr(cfg.defaults, "noise_schedule", None) or "karras"
@@ -2624,6 +2630,7 @@ class Nai5MutsumiPlugin(Star):
             model=model,
             source_text=desc,
             nsfw_ok=bool(allow_nsfw) and str(mode).startswith("adult"),
+            max_steps=28,
         )
         return img, mode
 
