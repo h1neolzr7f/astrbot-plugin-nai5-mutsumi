@@ -1,3 +1,7 @@
+# 1.5.1
+
+滤页误伤修复：OpenCV/启发式硬 `drop` 门槛抬高 + 收窄下腹 ROI + YCbCr/连通域二次确认；可疑页改 `censor`（黑块）优先于整页扔。缺 NudeNet 时用户文案标「OpenCV 降级」。`honzi_max_pages` 截断与全 drop 文案可读；发图失败不再 silently 计成功。
+
 # 1.5.0
 
 基线：`v1.4.23-stable`（线上舒服的漫画反推）。本版本只在独立分支增量加 `nai5本子`，**不改、不删该 tag**。`nai5反推` / `nai5反推漫画` / LAYOUT（含 slots.who 对齐、漫画关 thinking）与 1.4.23 一致。

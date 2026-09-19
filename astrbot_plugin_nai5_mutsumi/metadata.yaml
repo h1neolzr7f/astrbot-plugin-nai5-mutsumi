@@ -6,11 +6,11 @@ help: |
   本子批处理：nai5本子 <修改要求>；进度：nai5本子进度；取消：nai5本子取消
   例：nai5 窗边 mature woman 侧光；nai5本子 角色替换为博士和特蕾西娅
   流程：DeepSeek(provider=deepseek) + Skill → ppnai(NAI5 full, opus_free, max_concurrent=1) 出图
-  本子滤页只走本地 NudeNet/OpenCV/启发式，不走 DeepSeek 视觉。
+  本子滤页只走本地 NudeNet/OpenCV/启发式（缺 NudeNet 时诚实标 OpenCV 降级），不走 DeepSeek 视觉；硬 drop 门槛抬高，可疑改 censor。
   群聊每群成功 NAI5 最多 40 张，超出自动改用 nai-diffusion-4-5-full；私聊不受限。
   查额度：nai5额度 / 出图额度；管理员重置：nai5额度重置 [gid]
   全局同时只画 1 张；忙时提示「……在画了。排队。」并等待。
-version: 1.5.0
+version: 1.5.1
 author: dickding
 repo: local
 support_platforms:

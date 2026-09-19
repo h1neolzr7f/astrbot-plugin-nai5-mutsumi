@@ -22,17 +22,30 @@ from typing import Any, Iterable
 DEFAULT_ZIP_PASSWORD = "dickding"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
-# 显式：jm 12576 / jmi 12576 / 本子 12576
+# 显式：jm 123 / jm 12576 / jmi 10010 / 本子 12576（JM ID 最短可 3 位）
 _EXPLICIT_ID_RE = re.compile(
     r"(?i)(?:(?:^|[^\w])jm(?:c|i|s|update)?\s*[/:]?\s*|本子\s*(?:id\s*)?)"
-    r"(\d{4,12})"
+    r"(\d{3,12})"
 )
-_BRACKET_ID_RE = re.compile(r"[【\[\()](\d{4,12})[】\]\)]")
+_BRACKET_ID_RE = re.compile(r"[【\[\(](\d{3,12})[】\]\)]")
 # 文件名里独立数字段（避免把 2024 年当 ID：要求 ≥5 位或带密码后缀）
 _FNAME_ID_RE = re.compile(
     r"(?i)(?:^|[_\-\s\[\(])(\d{5,12})(?:[_\-\s\.\]\)]|$|dickding)"
 )
+# jm_cosmos 打包名：{album_id}_{unix_ts}.zip 或 {album_id}_ChN_{unix_ts}.zip
+_JM_PACK_NAME_RE = re.compile(
+    r"(?i)^(\d{1,12})_(?:[Cc]h\d+_)?(\d{9,11})(?:#PW[^.]*)?(?:\.zip)?$"
+)
 _PASSWORD_IN_NAME_RE = re.compile(r"(?i)dickding")
+
+
+def _looks_like_unix_ts(s: str) -> bool:
+    try:
+        n = int(s)
+    except ValueError:
+        return False
+    # 约 2001–2033；覆盖当前样例 1789794672（2026）
+    return 1_000_000_000 <= n <= 2_000_000_000
 
 
 @dataclass(frozen=True)
@@ -65,11 +78,29 @@ def parse_album_ids(text: str) -> list[str]:
     """从任意文本抽出本子 ID，不绑定某一本。"""
     s = text or ""
     found: list[str] = []
+
+    def _add(aid: str) -> None:
+        if aid and aid not in found:
+            found.append(aid)
+
+    # 优先识别 jm_cosmos 打包名，避免把 unix 时间戳当成 album_id
+    for token in re.findall(r"[\w.#-]+\.zip|[\w.#-]+", s, flags=re.I):
+        base = Path(token).name
+        m = _JM_PACK_NAME_RE.match(base)
+        if m and _looks_like_unix_ts(m.group(2)):
+            _add(m.group(1))
+
     for rx in (_EXPLICIT_ID_RE, _BRACKET_ID_RE, _FNAME_ID_RE):
         for m in rx.finditer(s):
             aid = m.group(1)
-            if aid not in found:
-                found.append(aid)
+            if _looks_like_unix_ts(aid):
+                continue
+            _add(aid)
+    # 若上面全被过滤空了，再回退放行 fname 数字（兼容纯时间戳误命名）
+    if not found:
+        for rx in (_EXPLICIT_ID_RE, _BRACKET_ID_RE, _FNAME_ID_RE):
+            for m in rx.finditer(s):
+                _add(m.group(1))
     return found
 
 
@@ -140,7 +171,11 @@ def default_download_dirs(extra: str | Path | None = None) -> list[Path]:
 
 
 def album_id_from_name(name: str) -> str:
-    ids = parse_album_ids(name or "")
+    base = Path(name or "").name
+    m = _JM_PACK_NAME_RE.match(base)
+    if m and _looks_like_unix_ts(m.group(2)):
+        return m.group(1)
+    ids = parse_album_ids(base)
     return ids[0] if ids else ""
 
 
@@ -177,6 +212,9 @@ def score_candidate(c: ZipCandidate, hint: ZipHint) -> int:
     name = c.path.name.lower()
     if c.album_id and c.album_id in hint.album_ids:
         score += 100
+    for aid in hint.album_ids:
+        if aid and name.startswith(f"{aid.lower()}_"):
+            score += 90
     for fn in hint.filenames:
         if fn.lower() == name:
             score += 80

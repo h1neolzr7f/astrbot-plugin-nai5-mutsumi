@@ -272,21 +272,54 @@ def _region_ratio(mask: list[list[int]], x0: float, y0: float, x1: float, y1: fl
     return (skin / total) if total else 0.0
 
 
+def _chest_censor_boxes(w: int, h: int, chest: float, groin: float = 0.0) -> list[NsfwBox]:
+    """胸部黑块；可疑下腹一并遮，避免整页 drop。"""
+    boxes = [
+        NsfwBox(
+            x=int(0.18 * w),
+            y=int(0.20 * h),
+            w=int(0.64 * w),
+            h=int(0.34 * h),
+            label="CHEST_SKIN",
+            score=chest,
+        )
+    ]
+    if groin >= 0.22:
+        boxes.append(
+            NsfwBox(
+                x=int(0.32 * w),
+                y=int(0.55 * h),
+                w=int(0.36 * w),
+                h=int(0.28 * h),
+                label="GROIN_SKIN",
+                score=groin,
+            )
+        )
+    return boxes
+
+
 def decide_from_skin_heuristic(
     path: Path,
     *,
     backend: str = "heuristic",
-    drop_groin: float = 0.32,
-    censor_chest: float = 0.38,
-    min_skin: float = 0.12,
+    drop_groin: float = 0.70,
+    soft_groin: float = 0.28,
+    censor_chest: float = 0.30,
+    min_skin: float = 0.10,
+    overall_drop: float = 0.35,
 ) -> FilterDecision:
-    """封面/对白页皮肤少 → keep；下腹高皮肤 → drop；胸部高皮肤 → censor。"""
+    """封面/对白页皮肤少 → keep；硬下腹 → drop；可疑/裸胸 → censor（优先于整页扔）。
+
+    缺 NudeNet 时 OpenCV/启发式偏严会误伤故事页；故提高硬 drop 门槛，
+    并把「可疑但不稳」降为局部涂黑保留。
+    """
     im = _open_rgb(path)
     try:
         w, h = im.size
         mask = _skin_mask_pil(im)
         overall = _region_ratio(mask, 0, 0, 1, 1)
-        groin = _region_ratio(mask, 0.28, 0.52, 0.72, 0.88)
+        # 收窄下腹 ROI，减少大腿/衣物误检
+        groin = _region_ratio(mask, 0.35, 0.58, 0.65, 0.82)
         chest = _region_ratio(mask, 0.22, 0.22, 0.78, 0.52)
         if overall < min_skin:
             return FilterDecision(
@@ -295,29 +328,27 @@ def decide_from_skin_heuristic(
                 reason=f"low_skin:{overall:.2f}",
                 backend=backend,
             )
-        if groin >= drop_groin and overall >= 0.18:
+        # 硬 drop：下腹皮肤极高 + 整页也不低（二次确认：面积本身）
+        if groin >= drop_groin and overall >= overall_drop:
             return FilterDecision(
                 action="drop",
                 score=groin,
                 reason=f"heuristic_groin:{groin:.2f}",
                 backend=backend,
             )
-        if chest >= censor_chest:
-            boxes = [
-                NsfwBox(
-                    x=int(0.18 * w),
-                    y=int(0.20 * h),
-                    w=int(0.64 * w),
-                    h=int(0.34 * h),
-                    label="CHEST_SKIN",
-                    score=chest,
-                )
-            ]
+        # 裸胸或可疑下腹 → censor，不整页扔
+        if chest >= censor_chest or (groin >= soft_groin and overall >= 0.14):
+            score = max(chest, groin)
+            reason = (
+                f"heuristic_chest:{chest:.2f}"
+                if chest >= censor_chest and chest >= groin
+                else f"heuristic_soft_groin:{groin:.2f}"
+            )
             return FilterDecision(
                 action="censor",
-                score=chest,
-                reason=f"heuristic_chest:{chest:.2f}",
-                boxes=boxes,
+                score=score,
+                reason=reason,
+                boxes=_chest_censor_boxes(w, h, max(chest, censor_chest), groin),
                 backend=backend,
             )
         return FilterDecision(
@@ -331,7 +362,11 @@ def decide_from_skin_heuristic(
 
 
 def decide_from_opencv(path: Path, **kwargs: Any) -> FilterDecision:
-    """OpenCV HSV 皮肤；失败则降级 Pillow 启发式。"""
+    """OpenCV HSV + YCbCr 二次确认；失败则降级 Pillow 启发式。
+
+    硬 drop 门槛显著高于旧版（0.30），并要求连通域与 YCbCr 交叉确认，
+    否则降为 censor，避免成人漫画故事/半露页几乎整本被扔。
+    """
     try:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
@@ -349,35 +384,84 @@ def decide_from_opencv(path: Path, **kwargs: Any) -> FilterDecision:
     m1 = cv2.inRange(hsv, lower1, upper1)
     m2 = cv2.inRange(hsv, lower2, upper2)
     mask = cv2.bitwise_or(m1, m2)
-    # 形态学去噪
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    # YCbCr 交叉：抑制头发/背景暖色误检
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    ymask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+    mask_y = cv2.bitwise_and(mask, ymask)
     h, w = mask.shape[:2]
-    def ratio(x0, y0, x1, y1) -> float:
+
+    def ratio(m, x0, y0, x1, y1) -> float:
         xa, xb = int(x0 * w), int(x1 * w)
         ya, yb = int(y0 * h), int(y1 * h)
-        roi = mask[ya:yb, xa:xb]
+        roi = m[ya:yb, xa:xb]
         if roi.size == 0:
             return 0.0
         return float(np.count_nonzero(roi)) / float(roi.size)
 
-    overall = ratio(0, 0, 1, 1)
-    groin = ratio(0.28, 0.52, 0.72, 0.88)
-    chest = ratio(0.22, 0.22, 0.78, 0.52)
+    overall = ratio(mask, 0, 0, 1, 1)
+    # 收窄下腹 ROI
+    groin = ratio(mask, 0.35, 0.58, 0.65, 0.82)
+    groin_y = ratio(mask_y, 0.35, 0.58, 0.65, 0.82)
+    chest = ratio(mask, 0.22, 0.22, 0.78, 0.52)
+    # 连通域：要求下腹存在较大连通皮肤块，避免散点误 drop
+    xa, xb = int(0.35 * w), int(0.65 * w)
+    ya, yb = int(0.58 * h), int(0.82 * h)
+    roi = mask[ya:yb, xa:xb]
+    max_cc = 0.0
+    if roi.size:
+        nlab, _labs, stats, _ = cv2.connectedComponentsWithStats(
+            (roi > 0).astype("uint8"), 8
+        )
+        if nlab > 1:
+            areas = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, nlab)]
+            max_cc = max(areas) / float(roi.size)
+
     backend = "opencv"
-    if overall < 0.12:
-        return FilterDecision(action="keep", score=overall, reason=f"low_skin:{overall:.2f}", backend=backend)
-    if groin >= 0.30 and overall >= 0.16:
-        return FilterDecision(action="drop", score=groin, reason=f"opencv_groin:{groin:.2f}", backend=backend)
-    if chest >= 0.36:
+    drop_groin = float(kwargs.get("drop_groin", 0.70))
+    soft_groin = float(kwargs.get("soft_groin", 0.28))
+    censor_chest = float(kwargs.get("censor_chest", 0.30))
+    overall_drop = float(kwargs.get("overall_drop", 0.35))
+    mcc_min = float(kwargs.get("mcc_min", 0.40))
+    gy_min = float(kwargs.get("gy_min", 0.60))
+
+    if overall < 0.10:
         return FilterDecision(
-            action="censor",
-            score=chest,
-            reason=f"opencv_chest:{chest:.2f}",
-            boxes=[NsfwBox(int(0.18 * w), int(0.20 * h), int(0.64 * w), int(0.34 * h), "CHEST_SKIN", chest)],
+            action="keep", score=overall, reason=f"low_skin:{overall:.2f}", backend=backend
+        )
+
+    hard = (
+        groin >= drop_groin
+        and overall >= overall_drop
+        and max_cc >= mcc_min
+        and groin_y >= gy_min
+    )
+    if hard:
+        return FilterDecision(
+            action="drop",
+            score=groin,
+            reason=f"opencv_groin:{groin:.2f}/y:{groin_y:.2f}/cc:{max_cc:.2f}",
             backend=backend,
         )
-    return FilterDecision(action="keep", score=overall, reason=f"skin_ok:{overall:.2f}", backend=backend)
+
+    if chest >= censor_chest or (groin >= soft_groin and overall >= 0.14):
+        score = max(chest, groin)
+        reason = (
+            f"opencv_chest:{chest:.2f}"
+            if chest >= censor_chest and chest >= groin
+            else f"opencv_soft_groin:{groin:.2f}"
+        )
+        return FilterDecision(
+            action="censor",
+            score=score,
+            reason=reason,
+            boxes=_chest_censor_boxes(w, h, max(chest, censor_chest), groin),
+            backend=backend,
+        )
+    return FilterDecision(
+        action="keep", score=overall, reason=f"skin_ok:{overall:.2f}", backend=backend
+    )
 
 
 def default_nudenet_paths(explicit: str = "") -> list[Path]:
@@ -415,7 +499,19 @@ class LocalNsfwFilter:
         self.drop_threshold = float(drop_threshold)
         self.censor_threshold = float(censor_threshold)
         self._detect_fn = detect_fn
+        self._nudenet_wanted = self.wanted in {"auto", "nudenet"}
         self._resolved = self._resolve_backend()
+        if self.is_opencv_fallback:
+            logger.info(
+                "[honzi] nsfw_filter start backend=%s cloud=never "
+                "note=OpenCV降级（无 NudeNet 本地权重）；硬drop门槛已抬高，可疑页改 censor",
+                self._resolved,
+            )
+        else:
+            logger.info(
+                "[honzi] nsfw_filter start backend=%s cloud=never",
+                self._resolved,
+            )
 
     @property
     def backend_id(self) -> str:
@@ -424,6 +520,16 @@ class LocalNsfwFilter:
     @property
     def is_local(self) -> bool:
         return True
+
+    @property
+    def is_opencv_fallback(self) -> bool:
+        """auto/nudenet 想要 NudeNet 但实际落到 opencv/heuristic。"""
+        return self._nudenet_wanted and self._resolved in {"opencv", "heuristic"}
+
+    def user_backend_label(self) -> str:
+        if self.is_opencv_fallback:
+            return f"{self._resolved}（OpenCV 降级，无 NudeNet）"
+        return self._resolved
 
     def _resolve_backend(self) -> str:
         if self._detect_fn is not None:

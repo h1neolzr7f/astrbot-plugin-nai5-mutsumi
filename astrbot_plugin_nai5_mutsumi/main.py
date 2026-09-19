@@ -2696,33 +2696,49 @@ class Nai5MutsumiPlugin(Star):
                 return
 
             self._honzi_q.update(job_id, status=JobStatus.FILTERING)
-            await self._send_plain_quiet(
-                event, "……本地滤页中（NudeNet/OpenCV/启发式，不走 DeepSeek 视觉）。"
-            )
             try:
                 filt = self._make_honzi_filter()
             except CloudVisionForbidden as e:
                 await self._send_plain_quiet(event, f"……过滤配置非法：{e}")
                 self._honzi_q.finish(job_id, error=str(e))
                 return
+            backend_label = (
+                filt.user_backend_label()
+                if hasattr(filt, "user_backend_label")
+                else filt.backend_id
+            )
+            await self._send_plain_quiet(
+                event,
+                f"……本地滤页中（{backend_label}，cloud=never，不走 DeepSeek 视觉）。",
+            )
             work, pages = await asyncio.to_thread(
                 extract_zip_pages,
                 cand.path,
                 None,
                 password=self._honzi_zip_password(),
             )
+            total_raw = len(pages)
             max_pages = max(1, self._cfg_int("honzi_max_pages", 40))
-            if len(pages) > max_pages:
+            truncated = False
+            if total_raw > max_pages:
                 logger.info(
                     "[%s] honzi truncate pages %s -> %s",
                     PLUGIN_NAME,
-                    len(pages),
+                    total_raw,
                     max_pages,
                 )
                 pages = pages[:max_pages]
+                truncated = True
+                await self._send_plain_quiet(
+                    event,
+                    f"……本子共 {total_raw} 页，honzi_max_pages={max_pages}，"
+                    f"已截到前 {max_pages} 页再滤/画。",
+                )
             kept_dir = work / "_kept"
             kept, results = await asyncio.to_thread(filt.filter_pages, pages, kept_dir)
             dropped = sum(1 for r in results if r.decision.action == "drop")
+            censored = sum(1 for r in results if r.decision.action == "censor")
+            kept_plain = sum(1 for r in results if r.decision.action == "keep")
             self._honzi_q.update(
                 job_id,
                 kept=len(kept),
@@ -2732,23 +2748,32 @@ class Nai5MutsumiPlugin(Star):
                 status=JobStatus.QUEUED,
             )
             logger.info(
-                "[%s] honzi filter backend=%s cloud=never kept=%s dropped=%s album=%s",
+                "[%s] honzi filter backend=%s cloud=never keep=%s censor=%s drop=%s "
+                "album=%s truncated=%s raw=%s",
                 PLUGIN_NAME,
                 filt.backend_id,
-                len(kept),
+                kept_plain,
+                censored,
                 dropped,
                 album_id,
+                truncated,
+                total_raw,
             )
             if not kept:
                 await self._send_plain_quiet(
-                    event, "……滤完没有可画的页（都过审不了）。换一本或放宽阈值。"
+                    event,
+                    "……滤完没有可画的页（几乎整本被本地规则丢掉）。"
+                    "可换一本更温和的、或先 jm 别的 ID；"
+                    "有 NudeNet 本地 onnx 时识别更准。"
+                    f"本次后端 {backend_label}，drop={dropped}/{len(results)}。",
                 )
                 self._honzi_q.finish(job_id, error="all dropped")
                 return
             await self._send_plain_quiet(
                 event,
-                f"……保留 {len(kept)} 页，剔除 {dropped} 页。"
-                f"后端 {filt.backend_id}。开始排队反推。nai5本子取消 可停。",
+                f"……保留 {len(kept)} 页（keep {kept_plain}+censor {censored}），"
+                f"剔除 {dropped} 页。后端 {backend_label}。"
+                f"开始排队反推。nai5本子取消 可停。",
             )
 
             sender = str(event.get_sender_id() or "").strip()
@@ -2818,21 +2843,41 @@ class Nai5MutsumiPlugin(Star):
                         jpeg = self._compress_jpeg_bytes(
                             img, max_edge=2048, quality=92, max_bytes=2500000
                         )
+                        send_ok = False
                         async with _qq_image_send_lock:
-                            ok = await self._send_onebot_image_only(event, jpeg)
-                            if not ok:
-                                await event.send(
-                                    event.chain_result([Image.fromBytes(jpeg)])
-                                )
-                        await self._send_plain_quiet(
-                            event, f"……本子 {i}/{len(kept)} 画好了。"
-                        )
+                            send_ok = await self._send_onebot_image_only(event, jpeg)
+                            if not send_ok:
+                                try:
+                                    await event.send(
+                                        event.chain_result([Image.fromBytes(jpeg)])
+                                    )
+                                    send_ok = True
+                                except Exception as se:
+                                    if self._is_send_timeout(se):
+                                        logger.warning(
+                                            "[%s] honzi chain Image timeout "
+                                            "(assume delivered): %s",
+                                            PLUGIN_NAME,
+                                            se,
+                                        )
+                                        send_ok = True
+                                    else:
+                                        raise
+                        if send_ok:
+                            await self._send_plain_quiet(
+                                event, f"……本子 {i}/{len(kept)} 画好了。"
+                            )
+                            self._honzi_q.mark_page(job_id, i, generated=True)
+                        else:
+                            await self._send_plain_quiet(
+                                event,
+                                f"……第 {i} 页图画好了，发出去失败。可稍后重试该页。",
+                            )
                     except Exception as e:
                         logger.warning("[%s] honzi send page fail: %s", PLUGIN_NAME, e)
                         await self._send_plain_quiet(
                             event, f"……第 {i} 页发出失败。"
                         )
-                    self._honzi_q.mark_page(job_id, i, generated=True)
                     logger.info(
                         "[%s] honzi page done i=%s/%s model=%s mode=%s used=%s downgraded=%s",
                         PLUGIN_NAME,

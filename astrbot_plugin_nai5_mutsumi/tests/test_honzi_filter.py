@@ -124,3 +124,100 @@ class TestDetectionsMock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestHeuristicOpenCVPolicy(unittest.TestCase):
+    """人造图：蓝图 keep；高皮肤下腹 drop；胸部区 censor；禁止 cloud。"""
+
+    def _make(self, path: Path, paint):
+        from PIL import Image, ImageDraw
+
+        im = Image.new("RGB", (200, 300), (20, 40, 180))
+        draw = ImageDraw.Draw(im)
+        paint(draw, im)
+        im.save(path, format="JPEG", quality=90)
+        return path
+
+    def test_blue_keep(self):
+        filt = LocalNsfwFilter(backend="heuristic")
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "blue.jpg"
+            self._make(src, lambda d, im: None)
+            d = filt.decide(src)
+            self.assertEqual(d.action, "keep")
+            self.assertFalse(d.cloud)
+
+    def test_artificial_groin_drop(self):
+        filt = LocalNsfwFilter(backend="heuristic")
+
+        def paint(draw, im):
+            # 下腹 ROI 填肤色（高面积）
+            w, h = im.size
+            draw.rectangle(
+                [int(0.35 * w), int(0.58 * h), int(0.65 * w), int(0.82 * h)],
+                fill=(210, 160, 130),
+            )
+            # 整页也铺一些肤色抬 overall
+            draw.rectangle([0, int(0.2 * h), w, h], fill=(205, 155, 125))
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "groin.jpg"
+            self._make(src, paint)
+            d = filt.decide(src)
+            self.assertEqual(d.action, "drop", d.reason)
+            self.assertFalse(d.cloud)
+
+    def test_artificial_chest_censor(self):
+        filt = LocalNsfwFilter(backend="heuristic")
+
+        def paint(draw, im):
+            w, h = im.size
+            # 仅胸部高肤，下腹保持蓝
+            draw.rectangle(
+                [int(0.22 * w), int(0.22 * h), int(0.78 * w), int(0.52 * h)],
+                fill=(215, 165, 135),
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "chest.jpg"
+            self._make(src, paint)
+            d = filt.decide(src)
+            self.assertEqual(d.action, "censor", d.reason)
+            self.assertTrue(d.boxes)
+            self.assertFalse(d.cloud)
+
+    def test_soft_groin_becomes_censor_not_drop(self):
+        """中等下腹肤色不应硬 drop，应 censor。"""
+        from honzi_filter import decide_from_skin_heuristic
+
+        def paint(draw, im):
+            w, h = im.size
+            # 中等皮肤：够 soft 不够 hard
+            draw.rectangle(
+                [int(0.35 * w), int(0.58 * h), int(0.65 * w), int(0.82 * h)],
+                fill=(210, 160, 130),
+            )
+            # overall 适中：只涂下半一点
+            draw.rectangle(
+                [int(0.2 * w), int(0.5 * h), int(0.8 * w), int(0.9 * h)],
+                fill=(200, 150, 120),
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "soft.jpg"
+            self._make(src, paint)
+            d = decide_from_skin_heuristic(src, drop_groin=0.70, soft_groin=0.28)
+            self.assertIn(d.action, ("censor", "keep"), d.reason)
+            self.assertNotEqual(d.action, "drop")
+
+    def test_opencv_fallback_label(self):
+        filt = LocalNsfwFilter(backend="auto")
+        # 无 nudenet 权重时多为 opencv/heuristic
+        if filt.backend_id in {"opencv", "heuristic"}:
+            self.assertTrue(filt.is_opencv_fallback)
+            self.assertIn("降级", filt.user_backend_label())
+        self.assertTrue(filt.is_local)
+
+    def test_cloud_still_forbidden(self):
+        with self.assertRaises(CloudVisionForbidden):
+            LocalNsfwFilter(backend="deepseek")
+

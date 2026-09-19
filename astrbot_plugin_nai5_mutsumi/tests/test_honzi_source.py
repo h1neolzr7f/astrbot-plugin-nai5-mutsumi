@@ -15,6 +15,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from honzi_source import (  # noqa: E402
+    album_id_from_name,
     SessionZipIndex,
     SessionZipRecord,
     ZipCandidate,
@@ -50,6 +51,16 @@ class TestParseAlbum(unittest.TestCase):
         )
         self.assertIn("55555", h.album_ids)
         self.assertTrue(any("55555" in p for p in h.paths))
+
+
+    def test_short_jm_and_pack_timestamp(self):
+        """jm_cosmos: {id}_{unix_ts}.zip；短 ID 与时间戳不可颠倒。"""
+        self.assertEqual(parse_album_ids("jm 123"), ["123"])
+        self.assertEqual(album_id_from_name("123_1789794672.zip"), "123")
+        self.assertEqual(album_id_from_name("321_Ch1_1789794672.zip"), "321")
+        ids = parse_album_ids("123_1789794672.zip")
+        self.assertEqual(ids[0], "123")
+        self.assertNotIn("1789794672", ids)
 
 
 class TestPickZip(unittest.TestCase):
