@@ -15,6 +15,7 @@ from manga_layout import (  # noqa: E402
     Panel,
     LayoutSlot,
     apply_layout_to_chars,
+    parse_layout_dict,
     assign_positions_from_slots,
     center_to_pos,
     classify_layout_kind,
@@ -283,3 +284,50 @@ class TestFallbackTranspose(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWhoAlign(unittest.TestCase):
+    def test_who_aligns_despite_char_order(self):
+        """CHARACTER 顺序与 slots 相反时，who 应对齐到正确格。"""
+        layout = parse_layout_dict({
+            "panel_count": 2,
+            "reading": "rtl",
+            "panels": [
+                {"id": 1, "x": 0, "y": 0, "w": 1, "h": 0.5},
+                {"id": 2, "x": 0, "y": 0.5, "w": 1, "h": 0.5},
+            ],
+            "slots": [
+                {"panel": 1, "cx": 0.5, "cy": 0.25, "who": "doctor (arknights)", "text": "博士？"},
+                {"panel": 2, "cx": 0.5, "cy": 0.75, "who": "theresa (arknights)", "text": "……"},
+            ],
+        })
+        # 故意反过来写 CHARACTER
+        chars = [
+            {"position": "C3", "prompt": "theresa (arknights), girl, blush"},
+            {"position": "C3", "prompt": "doctor (arknights), boy, helmet"},
+        ]
+        out = apply_layout_to_chars(chars, layout)
+        # cy=0.75 → row4；cy=0.25 → row2（与 ppnai centers 一致）
+        self.assertEqual(out[0]["position"][1], "4")  # theresa bottom
+        self.assertEqual(out[1]["position"][1], "2")  # doctor top
+        self.assertIn("……", out[0]["prompt"])
+        self.assertIn("博士", out[1]["prompt"])
+
+
+class TestBBoxCompat(unittest.TestCase):
+    def test_bbox_array_panels(self):
+        lay = parse_layout_dict({
+            "panel_count": 2,
+            "panels": [
+                {"id": 1, "bbox": [0.0, 0.0, 1.0, 0.5]},
+                {"id": 2, "bbox": [0.0, 0.5, 1.0, 0.5]},
+            ],
+            "slots": [
+                {"panel": 1, "bbox": [0.4, 0.1, 0.2, 0.2], "who": "a"},
+                {"panel": 2, "bbox": [0.4, 0.6, 0.2, 0.2], "who": "b"},
+            ],
+        })
+        self.assertIsNotNone(lay)
+        self.assertTrue(lay.usable())
+        self.assertAlmostEqual(lay.panels[0].h, 0.5, places=2)
+        self.assertAlmostEqual(lay.slots[0].cy, 0.2, places=2)

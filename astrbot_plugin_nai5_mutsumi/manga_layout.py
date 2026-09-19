@@ -96,6 +96,7 @@ class LayoutSlot:
     cy: float
     text: str = ""
     kind: str = ""
+    who: str = ""  # 可选：角色 tag/名，用于对齐 CHARACTER，避免下标错位
 
 
 @dataclass
@@ -197,10 +198,29 @@ def parse_layout_dict(data: dict[str, Any]) -> MangaLayout | None:
         if not isinstance(item, dict):
             continue
         pid = _as_int(item.get("id", item.get("n", i)), i)
-        x = clamp01(item.get("x", item.get("left", 0.0)))
-        y = clamp01(item.get("y", item.get("top", 0.0)))
-        w = clamp01(item.get("w", item.get("width", 0.0)), 0.0)
-        h = clamp01(item.get("h", item.get("height", 0.0)), 0.0)
+        # 兼容 bbox:[x,y,w,h] / [x1,y1,x2,y2]
+        bb = item.get("bbox") or item.get("box")
+        if isinstance(bb, (list, tuple)) and len(bb) >= 4:
+            try:
+                a, b, c, d = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+            except (TypeError, ValueError):
+                a = b = c = d = 0.0
+            if c > 1.0 or d > 1.0:
+                # 可能是像素，交给 clamp 前先粗归一（未知画布时只信相对）
+                pass
+            if c <= 1.5 and d <= 1.5 and a <= 1.5:
+                # [x,y,w,h]
+                x, y, w, h = a, b, c, d
+            else:
+                # [x1,y1,x2,y2]
+                x, y, w, h = a, b, max(0.0, c - a), max(0.0, d - b)
+        else:
+            x = clamp01(item.get("x", item.get("left", 0.0)))
+            y = clamp01(item.get("y", item.get("top", 0.0)))
+            w = clamp01(item.get("w", item.get("width", 0.0)), 0.0)
+            h = clamp01(item.get("h", item.get("height", 0.0)), 0.0)
+            x, y, w, h = float(x), float(y), float(w), float(h)
+        x, y, w, h = clamp01(x), clamp01(y), clamp01(w, 0.0), clamp01(h, 0.0)
         if w <= 0.02 or h <= 0.02:
             # 允许只给中心+粗略尺寸
             cx = item.get("cx")
@@ -227,6 +247,16 @@ def parse_layout_dict(data: dict[str, Any]) -> MangaLayout | None:
             pid = _as_int(item.get("panel", item.get("p", item.get("id", 0))), 0)
             cx = item.get("cx", item.get("x"))
             cy = item.get("cy", item.get("y"))
+            bb = item.get("bbox") or item.get("box")
+            if (cx is None or cy is None) and isinstance(bb, (list, tuple)) and len(bb) >= 4:
+                try:
+                    a, b, c, d = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+                    if c <= 1.5 and d <= 1.5:
+                        cx, cy = a + c / 2, b + d / 2
+                    else:
+                        cx, cy = (a + c) / 2, (b + d) / 2
+                except (TypeError, ValueError):
+                    pass
             if cx is None or cy is None:
                 pan = next((p for p in panels if p.id == pid), None)
                 if pan is None:
@@ -234,6 +264,10 @@ def parse_layout_dict(data: dict[str, Any]) -> MangaLayout | None:
                 cx, cy = pan.cx, pan.cy
             text = str(item.get("text", item.get("dialogue", "")) or "").strip()
             kind = str(item.get("kind", item.get("tk", item.get("text_kind", ""))) or "").strip().lower()
+            who = str(
+                item.get("who", item.get("tag", item.get("char", item.get("character", ""))))
+                or ""
+            ).strip()
             slots.append(
                 LayoutSlot(
                     panel=pid or 1,
@@ -241,6 +275,7 @@ def parse_layout_dict(data: dict[str, Any]) -> MangaLayout | None:
                     cy=clamp01(cy, 0.5),
                     text=text,
                     kind=kind,
+                    who=who,
                 )
             )
     if not slots:
@@ -425,16 +460,101 @@ def _unique_pos(pos: str, used: set[str], prefer_row: str = "3") -> str:
     return pos or "C3"
 
 
+def _norm_who(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[\(\)（）\[\]_\-]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _char_identity(prompt: str) -> str:
+    """从 CHARACTER 槽提取可用于对齐的身份串（优先角色 tag）。"""
+    body = (prompt or "").lower()
+    # danbooru 风格 name (series)
+    m = re.search(r"\b([a-z0-9][a-z0-9_' ]{1,40}?)\s*\([^)]{2,40}\)", body)
+    if m:
+        return _norm_who(m.group(0))
+    # 去掉权重与 speech/text 后取前几个 token
+    body = re.sub(r"-?\d+(?:\.\d+)?::(.+?)::", r"\1", body)
+    body = _TEXT_TAG_RE.sub("", body)
+    body = re.sub(r"(?i)\bspeech bubble\b|\brectangular narration box\b", "", body)
+    parts = [x.strip() for x in body.split(",") if x.strip()]
+    skip = {
+        "1girl", "1boy", "2girls", "2boys", "girl", "boy", "solo", "nsfw",
+        "male", "female", "upper body", "full body", "looking at viewer",
+    }
+    keep = [p for p in parts if p.lower() not in skip and not p.startswith("text:")]
+    return _norm_who(", ".join(keep[:3]))
+
+
+def _slot_matches_char(slot: LayoutSlot, char_prompt: str) -> bool:
+    who = _norm_who(slot.who)
+    if not who:
+        return False
+    ident = _char_identity(char_prompt)
+    if not ident:
+        return False
+    if who in ident or ident in who:
+        return True
+    # 单词重叠：theresa / doctor
+    wh = set(who.replace(",", " ").split())
+    idt = set(ident.replace(",", " ").split())
+    return len(wh & idt) >= 1 and bool(wh & idt - {"girl", "boy", "arknights"})
+
+
+def align_slots_to_chars(
+    chars: list[dict[str, str]], slots: list[LayoutSlot]
+) -> list[LayoutSlot]:
+    """槽→角色对齐：有 who/tag 时按身份匹配；否则按阅读序下标。"""
+    if not chars:
+        return []
+    # 先按 panel/cy/cx 排阅读序，稳定无 who 时的下标对齐
+    ordered = sorted(
+        enumerate(slots),
+        key=lambda it: (it[1].panel, round(it[1].cy, 3), round(it[1].cx, 3)),
+    )
+    slots_ord = [s for _, s in ordered]
+    if len(chars) > len(slots_ord):
+        # caller should pad; keep as-is
+        pass
+    used_slot: set[int] = set()
+    aligned: list[LayoutSlot | None] = [None] * len(chars)
+    # pass1: who 匹配
+    for ci, c in enumerate(chars):
+        body = c.get("prompt") or ""
+        for si, slot in enumerate(slots_ord):
+            if si in used_slot:
+                continue
+            if _slot_matches_char(slot, body):
+                aligned[ci] = slot
+                used_slot.add(si)
+                break
+    # pass2: 剩余按下标填
+    free = [s for si, s in enumerate(slots_ord) if si not in used_slot]
+    fi = 0
+    for ci in range(len(chars)):
+        if aligned[ci] is None:
+            if fi < len(free):
+                aligned[ci] = free[fi]
+                fi += 1
+            else:
+                aligned[ci] = LayoutSlot(panel=1, cx=0.5, cy=0.5)
+    return [s for s in aligned if s is not None]
+
+
 def apply_layout_to_chars(
     chars: list[dict[str, str]], layout: MangaLayout
 ) -> list[dict[str, str]]:
-    """用 LAYOUT 几何覆盖 CHARACTER 的 position；不改身份 tag。"""
+    """用 LAYOUT 几何覆盖 CHARACTER 的 position；不改身份 tag。
+
+    优先用 slot.who/tag 对齐角色，避免 CHARACTER 列表顺序与 slots 不一致时错格。
+    """
     if not layout.usable():
         return chars
     slots = list(layout.slots)
     if len(chars) > len(slots):
         extras = _extra_slots_from_panels(layout, len(chars) - len(slots))
         slots = slots + extras
+    slots = align_slots_to_chars(chars, slots)
     positions = assign_positions_from_slots(slots[: max(len(chars), 1)])
     out: list[dict[str, str]] = []
     for i, c in enumerate(chars):
@@ -505,7 +625,9 @@ def is_action_summary_text(text: str) -> bool:
         return True
     if any(low == x or low.startswith(x + " ") for x in _ACTION_LEMMAS_EN):
         return True
-    # 极短、无语气词的中文动词短语
+    # 极短、无语气词的中文动词短语（有问号/省略号/语气词则更像对白）
+    if re.search(r"[？?！!…～~]", t) or "……" in t or "..." in t:
+        return False
     cjk = re.findall(r"[\u4e00-\u9fff]", t)
     if 1 <= len(cjk) <= 4 and len(t) <= 6 and not _ZH_PARTICLE_RE.search(t):
         if any(k in t for k in _ACTION_LEMMAS_ZH):

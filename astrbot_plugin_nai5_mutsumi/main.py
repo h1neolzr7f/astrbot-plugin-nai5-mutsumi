@@ -546,7 +546,7 @@ SIZE:
 - 用户点名每个角色 → 各占一个 CHARACTER 槽；槽内必须有真实 NovelAI/Danbooru 角色 tag（如 amiya (arknights)、togawa sakiko）。
 - 禁止 CHARACTER 槽内只有 Character 1 / Character 2 / girl A 等占位而无真实 tag。
 - 多角色必须使用不同 position（如 B3/D3），禁止全部挤在 C3。
-- 漫画反推另输出 LAYOUT JSON（归一化 0–1 几何）；A1–E5 由系统按 cx/cy 计算（A–E=左→右，1–5=上→下）。
+- 漫画反推另输出 LAYOUT JSON（归一化 0–1 几何，slots 含 who/tag）；A1–E5 由系统按 cx/cy 计算（A–E=左→右，1–5=上→下）。
 - PROMPT 互动句可用 Character 1 / Character 2 指代槽位，但不能替代真实 tag，也不能把多人外观揉进 PROMPT。
 - 未点名默认学生团（收窄）：仅「你/自画像」或明确画人未点名时默认 `wakaba mutsumi`（仅 SFW）。反推/换成其它角色/其它作品/OC风景 → 不默认。
 - 身份：你是若叶睦。「自画像/画你自己」或「你」代指主体 → `wakaba mutsumi`。
@@ -1646,14 +1646,14 @@ class Nai5MutsumiPlugin(Star):
                 "LAYOUT:\n"
                 '{"panel_count":N,"reading":"rtl","kind":"stacked_strips|grid|asymmetric",'
                 '"panels":[{"id":1,"x":0,"y":0,"w":1,"h":0.2,"shot":"upper body"}],'
-                '"slots":[{"panel":1,"cx":0.5,"cy":0.1,"text":"原文或空","kind":"bubble|narration|"}]}\n'
+                '"slots":[{"panel":1,"cx":0.5,"cy":0.1,"who":"角色tag","text":"原文或空","kind":"bubble|narration|"}]}\n'
                 "kind 必须由几何得出：全宽横条上下叠=stacked_strips；全高竖列左右排=stacked_columns；"
                 "近似行列网格=grid；其余=asymmetric。禁止用 comic page 代替格数。"
                 "text 只能是气泡/旁白里的原句（≤16字）；看不清就空串；禁止把动作/表情写成 text。"
                 "然后输出 PROMPT / CHARACTER / UC / SIZE。"
                 "【PROMPT】`1.4::N-panel manga page::` + 阅读方向 + 格框/沟 + 几何短句；"
                 "可写景别（close-up / hands），禁止角色名、台词、格内剧情。"
-                "【CHARACTER】每人一槽：真实 tag + 该格姿势加权；有对白才写 "
+                "【CHARACTER】每人一槽：真实 tag + 该格姿势加权；LAYOUT.slots.who 必须与角色 tag 对应；有对白才写 "
                 '`speech bubble, text: "原句"`。旁白单独槽。'
                 "换角色只改身份/服装。SIZE=1024x1024。禁止默认学生团。"
             )
@@ -1694,12 +1694,23 @@ class Nai5MutsumiPlugin(Star):
                     prompt=user,
                     system_prompt=system,
                     image_urls=list(image_urls) if image_urls else None,
-                    thinking={"type": "enabled"},
+                    # 漫画反推要稳定 JSON：关掉 thinking，避免答案只进 reasoning_content
+                    thinking={"type": "disabled" if manga_reverse else "enabled"},
                     reasoning_effort=effort,
                 ),
                 timeout=timeout,
             )
-            return (resp.completion_text or "").strip()
+            text = (resp.completion_text or "").strip()
+            if not text:
+                # deepseek-flash 等模型偶发只填 reasoning_content
+                text = (getattr(resp, "reasoning_content", None) or "").strip()
+                if text:
+                    logger.warning(
+                        "[%s] LLM content empty; using reasoning_content chars=%s",
+                        PLUGIN_NAME,
+                        len(text),
+                    )
+            return text
 
         try:
             from _qqbot_common.req_cache import draw_prompt_cache, normalize_text
@@ -1882,7 +1893,7 @@ class Nai5MutsumiPlugin(Star):
             repair = (
                 f"上次输出不合格（原因={reason}）。禁止抱歉/不能/道德说教。"
                 + (
-                    "必须先输出 LAYOUT JSON，再输出 PROMPT/CHARACTER/UC/SIZE。"
+                    "必须先输出 LAYOUT JSON（slots 含 who/tag 对齐角色），再输出 PROMPT/CHARACTER/UC/SIZE。"
                     if manga_reverse
                     else "必须只输出 PROMPT/CHARACTER/UC/SIZE。"
                 )
