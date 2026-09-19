@@ -99,13 +99,19 @@
   "honzi_nsfw_backend": {
     "description": "本子页本地 NSFW 后端（禁止云端视觉）",
     "type": "string",
-    "hint": "auto / nudenet / opencv / heuristic；禁止 deepseek/openai 等",
+    "hint": "auto / litang / baibaoxiang / nudenet / opencv / heuristic；禁止 deepseek/openai 等",
     "default": "auto"
   },
   "honzi_nudenet_model_path": {
     "description": "NudeNet ONNX 权重绝对路径（空则探测 ~/.NudeNet 与插件 data）",
     "type": "string",
     "hint": "只读本地文件，不会为审查去下载/调用云端视觉",
+    "default": ""
+  },
+  "honzi_litang_model_path": {
+    "description": "理塘打码 censor.onnx 绝对路径（空则探测插件 data/litang 与宿主机 models/litang-censor）",
+    "type": "string",
+    "hint": "来自 litang-baibaoxiang Release；只读本地，不联网",
     "default": ""
   },
   "honzi_nsfw_threshold": {

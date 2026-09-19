@@ -3,7 +3,7 @@
 强制约束
 ========
 - **禁止** DeepSeek / OpenAI / 任何云端视觉 API。
-- 只在本机跑：NudeNet ONNX（可选）→ OpenCV 皮肤启发式 → Pillow 启发式。
+- 只在本机跑：理塘 censor.onnx（可选）→ NudeNet ONNX（可选）→ OpenCV → Pillow 启发式。
 - 权重路径可配置；缺权重自动降级，不发起 HTTP 下载审查模型。
 """
 
@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable, Literal
 logger = logging.getLogger("astrbot_plugin_nai5_mutsumi.honzi_filter")
 
 FilterAction = Literal["keep", "censor", "drop"]
-BackendName = Literal["auto", "nudenet", "opencv", "heuristic"]
+BackendName = Literal["auto", "litang", "baibaoxiang", "nudenet", "opencv", "heuristic"]
 
 # 明确拒绝的云端/远程后端名（防误配）
 _FORBIDDEN_BACKENDS = frozenset(
@@ -49,6 +49,9 @@ _DROP_CLASSES = frozenset(
         "EXPOSED_GENITALIA_M",
         "EXPOSED_ANUS",
         "GENITALIA_EXPOSED",
+        # 理塘 YOLO 原始类名
+        "PENIS",
+        "PUSSY",
     }
 )
 # 裸胸/臀 → 局部遮挡后保留
@@ -61,6 +64,9 @@ _CENSOR_CLASSES = frozenset(
         "EXPOSED_BREAST_M",
         "EXPOSED_BUTTOCKS",
         "BELLY_EXPOSED",
+        # 理塘 YOLO 原始类名
+        "NIPPLE_F",
+        "NIPPLE",
     }
 )
 
@@ -99,18 +105,23 @@ class CloudVisionForbidden(ValueError):
     """配置了云端视觉后端时抛出，保证审查永不离机。"""
 
 
+_LOCAL_BACKENDS = frozenset(
+    {"auto", "litang", "baibaoxiang", "nudenet", "opencv", "heuristic"}
+)
+
+
 def assert_local_backend(name: str) -> str:
     raw = (name or "auto").strip().lower() or "auto"
     if raw in _FORBIDDEN_BACKENDS or raw.startswith(("http://", "https://")):
         raise CloudVisionForbidden(
             f"禁止云端视觉 NSFW 审查：backend={name!r}。"
-            "请用 auto / nudenet / opencv / heuristic。"
+            "请用 auto / litang / nudenet / opencv / heuristic。"
         )
-    if raw not in {"auto", "nudenet", "opencv", "heuristic"}:
+    if raw not in _LOCAL_BACKENDS:
         raise CloudVisionForbidden(
-            f"未知 NSFW 后端 {name!r}（只允许本地 auto/nudenet/opencv/heuristic）"
+            f"未知 NSFW 后端 {name!r}（只允许本地 auto/litang/baibaoxiang/nudenet/opencv/heuristic）"
         )
-    return raw
+    return "litang" if raw == "baibaoxiang" else raw
 
 
 def _norm_label(label: str) -> str:
@@ -490,6 +501,7 @@ class LocalNsfwFilter:
         self,
         backend: str = "auto",
         model_path: str = "",
+        litang_model_path: str = "",
         drop_threshold: float = 0.6,
         censor_threshold: float = 0.5,
         detect_fn: Callable[[str], list[dict[str, Any]]] | None = None,
@@ -499,12 +511,14 @@ class LocalNsfwFilter:
         self.drop_threshold = float(drop_threshold)
         self.censor_threshold = float(censor_threshold)
         self._detect_fn = detect_fn
+        self._litang_model_path = (litang_model_path or "").strip()
+        self._detector_wanted = self.wanted in {"auto", "litang", "nudenet"}
         self._nudenet_wanted = self.wanted in {"auto", "nudenet"}
         self._resolved = self._resolve_backend()
         if self.is_opencv_fallback:
             logger.info(
                 "[honzi] nsfw_filter start backend=%s cloud=never "
-                "note=OpenCV降级（无 NudeNet 本地权重）；硬drop门槛已抬高，可疑页改 censor",
+                "note=OpenCV降级（无理塘/NudeNet 本地权重）；硬drop门槛已抬高，可疑页改 censor",
                 self._resolved,
             )
         else:
@@ -523,36 +537,65 @@ class LocalNsfwFilter:
 
     @property
     def is_opencv_fallback(self) -> bool:
-        """auto/nudenet 想要 NudeNet 但实际落到 opencv/heuristic。"""
-        return self._nudenet_wanted and self._resolved in {"opencv", "heuristic"}
+        """auto/litang/nudenet 想要检测器但实际落到 opencv/heuristic。"""
+        return self._detector_wanted and self._resolved in {"opencv", "heuristic"}
 
     def user_backend_label(self) -> str:
         if self.is_opencv_fallback:
-            return f"{self._resolved}（OpenCV 降级，无 NudeNet）"
+            return f"{self._resolved}（OpenCV 降级，无理塘/NudeNet）"
+        if self._resolved == "litang":
+            return "litang（理塘打码模型）"
         return self._resolved
 
     def _resolve_backend(self) -> str:
         if self._detect_fn is not None:
-            return "nudenet-mock" if self.wanted in {"auto", "nudenet"} else self.wanted
+            if self.wanted in {"auto", "litang"}:
+                return "litang-mock"
+            if self.wanted == "nudenet":
+                return "nudenet-mock"
+            return self.wanted
         if self.wanted == "heuristic":
             return "heuristic"
         if self.wanted == "opencv":
             return "opencv"
-        if self.wanted in {"auto", "nudenet"}:
-            if self._nudenet_ready():
-                return "nudenet"
-            if self.wanted == "nudenet":
-                logger.warning(
-                    "[honzi] NudeNet 不可用（未安装或无本地权重），降级 opencv/heuristic；"
-                    "不会下载云端模型，更不会走 DeepSeek"
-                )
-            try:
-                import cv2  # noqa: F401
+        # auto / litang / nudenet
+        if self.wanted in {"auto", "litang"} and self._litang_ready():
+            return "litang"
+        if self.wanted == "litang":
+            logger.warning(
+                "[honzi] 理塘 censor.onnx 不可用，降级 nudenet/opencv；不会下载云端模型"
+            )
+        if self.wanted in {"auto", "nudenet"} and self._nudenet_ready():
+            return "nudenet"
+        if self.wanted == "nudenet":
+            logger.warning(
+                "[honzi] NudeNet 不可用（未安装或无本地权重），降级 opencv/heuristic；"
+                "不会下载云端模型，更不会走 DeepSeek"
+            )
+        try:
+            import cv2  # noqa: F401
 
-                return "opencv"
+            return "opencv"
+        except ImportError:
+            return "heuristic"
+
+    def _litang_ready(self) -> bool:
+        try:
+            from litang_censor import litang_ready, find_litang_model  # type: ignore
+        except ImportError:
+            try:
+                from .litang_censor import litang_ready, find_litang_model  # type: ignore
             except ImportError:
-                return "heuristic"
-        return "heuristic"
+                return False
+        explicit = self._litang_model_path or (
+            self.model_path if self.model_path.endswith("censor.onnx") else ""
+        )
+        if not litang_ready(explicit):
+            return False
+        found = find_litang_model(explicit)
+        if found:
+            self._litang_model_path = str(found)
+        return True
 
     def _nudenet_ready(self) -> bool:
         try:
@@ -566,6 +609,22 @@ class LocalNsfwFilter:
                 return True
         # 没有本地 onnx 就不启用，避免 NudeNet 首次 init 去拉权重
         return False
+
+    def _litang_detect(self, image_path: str) -> list[dict[str, Any]]:
+        if self._detect_fn is not None:
+            return list(self._detect_fn(image_path) or [])
+        try:
+            from litang_censor import detect_litang  # type: ignore
+        except ImportError:
+            from .litang_censor import detect_litang  # type: ignore
+        mp = getattr(self, "_litang_model_path", "") or (
+            self.model_path if self.model_path.endswith("censor.onnx") else ""
+        )
+        return detect_litang(
+            image_path,
+            model_path=mp,
+            conf=0.20,
+        )
 
     def _nudenet_detect(self, image_path: str) -> list[dict[str, Any]]:
         if self._detect_fn is not None:
@@ -585,6 +644,31 @@ class LocalNsfwFilter:
             self._resolved,
             path.name,
         )
+        if self._resolved.startswith("litang"):
+            try:
+                dets = self._litang_detect(str(path))
+                return decide_from_detections(
+                    dets,
+                    drop_threshold=self.drop_threshold,
+                    censor_threshold=self.censor_threshold,
+                    backend=self._resolved,
+                )
+            except CloudVisionForbidden:
+                raise
+            except Exception as e:
+                logger.warning("[honzi] 理塘模型失败，降级 NudeNet/启发式: %s", e)
+                if self._nudenet_ready():
+                    try:
+                        dets = self._nudenet_detect(str(path))
+                        return decide_from_detections(
+                            dets,
+                            drop_threshold=self.drop_threshold,
+                            censor_threshold=self.censor_threshold,
+                            backend="nudenet",
+                        )
+                    except Exception as e2:
+                        logger.warning("[honzi] NudeNet 亦失败: %s", e2)
+                return decide_from_skin_heuristic(path, backend="heuristic")
         if self._resolved.startswith("nudenet"):
             try:
                 dets = self._nudenet_detect(str(path))

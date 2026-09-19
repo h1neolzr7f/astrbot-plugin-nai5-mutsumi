@@ -39,8 +39,9 @@ class TestBackendGuard(unittest.TestCase):
                 LocalNsfwFilter(backend=name)
 
     def test_local_backends_ok(self):
-        for name in ("auto", "nudenet", "opencv", "heuristic"):
-            self.assertEqual(assert_local_backend(name), name)
+        for name in ("auto", "litang", "baibaoxiang", "nudenet", "opencv", "heuristic"):
+            got = assert_local_backend(name)
+            self.assertEqual(got, "litang" if name == "baibaoxiang" else name)
 
 
 class TestDetectionsMock(unittest.TestCase):
@@ -221,3 +222,55 @@ class TestHeuristicOpenCVPolicy(unittest.TestCase):
         with self.assertRaises(CloudVisionForbidden):
             LocalNsfwFilter(backend="deepseek")
 
+
+
+class TestLitangBackend(unittest.TestCase):
+    def test_baibaoxiang_alias(self):
+        self.assertEqual(assert_local_backend("baibaoxiang"), "litang")
+
+    def test_litang_mock_drop(self):
+        def fake(_path: str):
+            return [
+                {
+                    "class": "MALE_GENITALIA_EXPOSED",
+                    "raw_class": "penis",
+                    "score": 0.88,
+                    "box": [10, 20, 30, 40],
+                }
+            ]
+
+        filt = LocalNsfwFilter(backend="litang", detect_fn=fake)
+        self.assertTrue(filt.backend_id.startswith("litang"))
+        self.assertTrue(filt.is_local)
+        with tempfile.TemporaryDirectory() as td:
+            src = _tiny_jpeg(Path(td) / "p.jpg")
+            d = filt.decide(src)
+            self.assertEqual(d.action, "drop")
+            self.assertFalse(d.cloud)
+
+    def test_litang_mock_censor_nipple(self):
+        def fake(_path: str):
+            return [
+                {
+                    "class": "FEMALE_BREAST_EXPOSED",
+                    "raw_class": "nipple_f",
+                    "score": 0.7,
+                    "box": [5, 5, 20, 20],
+                }
+            ]
+
+        filt = LocalNsfwFilter(backend="auto", detect_fn=fake)
+        with tempfile.TemporaryDirectory() as td:
+            src = _tiny_jpeg(Path(td) / "p.jpg")
+            d = filt.decide(src)
+            self.assertEqual(d.action, "censor")
+
+    def test_litang_raw_labels_in_decide(self):
+        d = decide_from_detections(
+            [{"class": "PENIS", "score": 0.9, "box": [1, 1, 10, 10]}]
+        )
+        self.assertEqual(d.action, "drop")
+        d2 = decide_from_detections(
+            [{"class": "NIPPLE_F", "score": 0.8, "box": [1, 1, 10, 10]}]
+        )
+        self.assertEqual(d2.action, "censor")

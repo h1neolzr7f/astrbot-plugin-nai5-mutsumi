@@ -1,0 +1,9 @@
+censor.onnx
+===========
+Source: litang-baibaoxiang (理塘百宝箱) Android release v0.29 / v2.4.3
+URL: https://github.com/h1neolzr7f/litang-baibaoxiang/releases/tag/v2.4.3
+Asset: litang-baibaoxiang-v0.29-android-arm64.apk → assets/censor.onnx
+Upstream project: https://github.com/h1neolzr7f/litang-baibaoxiang (AGPL-3.0)
+Model: Ultralytics YOLO detect; classes {0: nipple_f, 1: penis, 2: pussy}
+sha256: 17f2ff352b755fa230412f6fc735577f009d4bc5275a23a2add4333587dce96e
+Extracted for local ONNX Runtime inference only; not re-distributed via git.

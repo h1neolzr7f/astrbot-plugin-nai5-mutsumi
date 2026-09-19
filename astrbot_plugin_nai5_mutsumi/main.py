@@ -2589,6 +2589,7 @@ class Nai5MutsumiPlugin(Star):
         return LocalNsfwFilter(
             backend=self._cfg_str("honzi_nsfw_backend", "auto"),
             model_path=self._cfg_str("honzi_nudenet_model_path", ""),
+            litang_model_path=self._cfg_str("honzi_litang_model_path", ""),
             drop_threshold=float(self.config.get("honzi_nsfw_threshold", 0.6) or 0.6),
         )
 

@@ -1,3 +1,7 @@
+# 1.5.2
+
+接入理塘百宝箱 `censor.onnx`（YOLO：nipple_f/penis/pussy）作本子滤页本地后端。`auto` 优先序：litang → nudenet → opencv → heuristic；亦可显式 `litang`/`baibaoxiang`。权重放宿主机 `models/litang-censor/` 与插件 data `litang/`，不进 git；保留上游 NOTICE。仍禁止云端视觉。
+
 # 1.5.1
 
 滤页误伤修复：OpenCV/启发式硬 `drop` 门槛抬高 + 收窄下腹 ROI + YCbCr/连通域二次确认；可疑页改 `censor`（黑块）优先于整页扔。缺 NudeNet 时用户文案标「OpenCV 降级」。`honzi_max_pages` 截断与全 drop 文案可读；发图失败不再 silently 计成功。
