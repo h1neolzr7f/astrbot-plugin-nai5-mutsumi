@@ -1,1 +1,4 @@
 # reuse ppnai / astrbot deps; no extra pins
+# nai5本子 本地滤页（可选，缺则降级启发式，绝不走云端视觉）：
+# nudenet
+# opencv-python-headless
